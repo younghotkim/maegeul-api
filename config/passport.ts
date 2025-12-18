@@ -22,24 +22,49 @@ if (kakaoClientID) {
 
     // 프로덕션 환경
     if (process.env.NODE_ENV === "production") {
-      // 환경 변수로 명시적으로 설정된 경우
-      const serverHost = process.env.SERVER_HOST || process.env.EXTERNAL_HOST;
+      // 디버깅: 환경 변수 로깅
+      console.log("🔍 환경 변수 확인:");
+      console.log(`  - NODE_ENV: ${process.env.NODE_ENV}`);
+      console.log(`  - SERVER_HOST: ${process.env.SERVER_HOST || "(없음)"}`);
+      console.log(
+        `  - EXTERNAL_HOST: ${process.env.EXTERNAL_HOST || "(없음)"}`
+      );
+      console.log(
+        `  - RENDER_EXTERNAL_HOSTNAME: ${
+          process.env.RENDER_EXTERNAL_HOSTNAME || "(없음)"
+        }`
+      );
+      console.log(
+        `  - KAKAO_CALLBACK_URL: ${process.env.KAKAO_CALLBACK_URL || "(없음)"}`
+      );
+      console.log(`  - PORT: ${process.env.PORT || "5000"}`);
+
+      // 환경 변수로 명시적으로 설정된 경우 (우선순위: KAKAO_CALLBACK_URL > SERVER_HOST > EXTERNAL_HOST > RENDER_EXTERNAL_HOSTNAME)
+      const serverHost =
+        process.env.SERVER_HOST ||
+        process.env.EXTERNAL_HOST ||
+        process.env.RENDER_EXTERNAL_HOSTNAME; // Render 자동 제공 환경 변수
       const serverPort = process.env.PORT || "5000";
 
       if (serverHost) {
         const protocol = process.env.SERVER_PROTOCOL || "https";
         const port = protocol === "https" ? "" : `:${serverPort}`;
-        return `${protocol}://${serverHost}${port}/api/kakao/callback`;
+        const callbackURL = `${protocol}://${serverHost}${port}/api/kakao/callback`;
+        console.log(`✅ 카카오 콜백 URL 생성: ${callbackURL}`);
+        return callbackURL;
       }
 
       // 환경 변수가 없으면 경고
       console.warn(
-        "⚠️  SERVER_HOST 또는 EXTERNAL_HOST 환경 변수가 설정되지 않았습니다."
+        "⚠️  SERVER_HOST, EXTERNAL_HOST, 또는 RENDER_EXTERNAL_HOSTNAME 환경 변수가 설정되지 않았습니다."
       );
       console.warn("⚠️  카카오 콜백 URL을 자동으로 생성할 수 없습니다.");
+      console.warn(
+        "⚠️  Render 환경에서는 RENDER_EXTERNAL_HOSTNAME이 자동으로 제공됩니다."
+      );
       // 기본값 제거, 명시적 설정 강제
       throw new Error(
-        "카카오 콜백 URL을 설정하려면 SERVER_HOST 또는 KAKAO_CALLBACK_URL 환경 변수를 설정하세요."
+        "카카오 콜백 URL을 설정하려면 SERVER_HOST, EXTERNAL_HOST, RENDER_EXTERNAL_HOSTNAME 중 하나 또는 KAKAO_CALLBACK_URL 환경 변수를 설정하세요."
       );
     }
 
