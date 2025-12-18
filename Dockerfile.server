@@ -1,0 +1,30 @@
+FROM node:18-alpine
+
+WORKDIR /app
+
+# 네이티브 모듈 빌드를 위한 빌드 도구 설치
+RUN apk add --no-cache python3 make g++
+
+# package.json과 package-lock.json 복사
+COPY package*.json ./
+
+# 모든 의존성 설치 (컨테이너 내에서 네이티브 모듈 빌드)
+RUN npm ci
+
+# 소스 코드 복사
+COPY . .
+
+# TypeScript 빌드
+RUN npm run build
+
+# 프로덕션 의존성만 유지 (bcrypt는 유지)
+RUN npm prune --production
+
+# 빌드 도구 제거 (이미 빌드 완료)
+RUN apk del python3 make g++
+
+# 포트 노출
+EXPOSE 5000
+
+# 서버 실행
+CMD ["node", "dist/app.js"]

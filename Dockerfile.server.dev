@@ -1,0 +1,21 @@
+FROM node:18-alpine
+
+WORKDIR /app
+
+# 네이티브 모듈 빌드를 위한 빌드 도구 설치 (항상 유지)
+RUN apk add --no-cache python3 make g++
+
+# package.json 복사 및 의존성 설치 (컨테이너 내에서 네이티브 모듈 빌드)
+COPY package*.json ./
+RUN npm install
+
+# 소스 코드 복사
+COPY . .
+
+# Prisma Client 생성 (linux-musl용)
+RUN npx prisma generate
+
+EXPOSE 5000
+
+# 기본 명령어 - bcrypt 재빌드 후 서버 실행
+CMD ["sh", "-c", "npm rebuild bcrypt --build-from-source && npm run dev"]

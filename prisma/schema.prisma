@@ -1,0 +1,78 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  user_id         Int       @id @default(autoincrement())
+  email           String    @unique @db.VarChar(255)
+  username        String    @db.VarChar(255)
+  profile_name    String?   @db.VarChar(255)
+  password        String    @db.VarChar(255)
+  salt            String    @db.VarChar(255)
+  age             Int?
+  gender          String?   @db.VarChar(10)
+  login_type      String    @default("local") @db.VarChar(50)
+  profile_picture String?   @db.Text
+  kakao_id        String?   @unique @db.VarChar(255)
+  created_at      DateTime  @default(now())
+
+  diaries         Diary[]
+  moodMeters      MoodMeter[]
+  emotionAnalyses EmotionAnalysis[]
+
+  @@map("User")
+}
+
+model Diary {
+  diary_id   Int      @id @default(autoincrement())
+  user_id    Int
+  title      String   @db.VarChar(255)
+  content    String   @db.Text
+  color      String   @db.VarChar(50)
+  date       DateTime @default(now())
+
+  user       User     @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
+  emotions   EmotionAnalysis[]
+
+  @@index([user_id])
+  @@map("Diary")
+}
+
+model MoodMeter {
+  id           Int      @id @default(autoincrement())
+  user_id      Int
+  label        String   @db.VarChar(255)
+  color        String   @db.VarChar(50)
+  pleasantness Int
+  energy       Int
+  created_at   DateTime @default(now())
+
+  user         User     @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
+
+  @@index([user_id])
+  @@map("MoodMeter")
+}
+
+model EmotionAnalysis {
+  id             Int      @id @default(autoincrement())
+  user_id        Int
+  diary_id       Int
+  emotion_result String   @db.Text
+  created_at     DateTime @default(now())
+
+  user           User     @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
+  diary          Diary    @relation(fields: [diary_id], references: [diary_id], onDelete: Cascade)
+
+  @@index([user_id])
+  @@index([diary_id])
+  @@map("EmotionAnalysis")
+}
