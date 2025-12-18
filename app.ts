@@ -78,7 +78,8 @@ app.use(passport.session());
 // 라우트 설정
 app.use("/api/analyze", analyzeRoute);
 app.use("/api", userRoutes);
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+// Vercel Blob Storage 사용으로 로컬 업로드 폴더 정적 서빙 불필요
+// app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 app.use("/api", uploadRoutes);
 app.use("/api", kakaoAuthRoutes);
 app.use("/api", moodmeterRoutes);
@@ -138,14 +139,18 @@ app.get("/health", (req, res) => {
 });
 
 // 서버 시작
-const PORT = process.env.PORT || 5000;
+// 개발 환경에서는 5001, 프로덕션에서는 환경 변수 또는 5000 사용
+const PORT =
+  process.env.PORT || (process.env.NODE_ENV === "production" ? 5000 : 5001);
 const HOST = process.env.HOST || "0.0.0.0"; // 공유망 접근을 위해 0.0.0.0 사용
 app.listen(Number(PORT), HOST, () => {
   console.log(`Server running on http://${HOST}:${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
 });
 
-// 업로드 폴더가 없다면 생성
-const uploadPath = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadPath)) {
-  fs.mkdirSync(uploadPath);
-}
+// Vercel Blob Storage 사용으로 로컬 업로드 폴더는 더 이상 필요 없음
+// 개발 환경에서만 필요할 경우 주석 해제
+// const uploadPath = path.join(__dirname, "uploads");
+// if (!fs.existsSync(uploadPath)) {
+//   fs.mkdirSync(uploadPath);
+// }

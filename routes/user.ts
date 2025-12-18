@@ -1,20 +1,16 @@
 import express, { Request, Response } from "express";
 import * as userController from "../controllers/userController";
 import multer from "multer";
-import path from "path";
 
 const router = express.Router();
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, path.join(__dirname, "../uploads"));
-  },
-  filename: (req, file, cb) => {
-    cb(null, `${Date.now()}-${file.originalname}`);
-  },
-});
+// Vercel Blob Storage 사용을 위해 memory storage 사용
+const storage = multer.memoryStorage();
 
-const upload = multer({ storage });
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB 제한
+});
 
 router.post(
   "/register",
@@ -37,9 +33,7 @@ router.post("/check-email", (req: Request, res: Response) => {
 
   userController.checkDuplicateEmail(email, (err, isDuplicate) => {
     if (err) {
-      res
-        .status(500)
-        .json({ message: "Internal server error", error: err });
+      res.status(500).json({ message: "Internal server error", error: err });
       return;
     }
 

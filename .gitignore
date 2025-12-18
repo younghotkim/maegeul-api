@@ -1,4 +1,13 @@
-.env*
+# .env.example은 Git에 포함 (템플릿 파일)
+# .env 파일들은 Git에 제외
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.development
+.env.production
+
 /generated/prisma
 
 node_modules/
