@@ -5,12 +5,29 @@ import {
   getColorKeywordCount,
   getLabelForUser,
 } from "../controllers/moodController";
+import { authenticateToken, verifyUserOwnership } from "../middleware/auth";
 
 const router = express.Router();
 
-router.post("/save-moodmeter", createMoodMeter);
-router.get("/moodmeter/user/:user_id", getMoodMeterForUser);
-router.get("/moodmeter/colorcount/:user_id", getColorKeywordCount);
-router.get("/moodmeter/label/:user_id", getLabelForUser);
+// All mood routes require authentication
+router.post("/save-moodmeter", authenticateToken, createMoodMeter);
+router.get(
+  "/moodmeter/user/:user_id",
+  authenticateToken,
+  verifyUserOwnership,
+  getMoodMeterForUser
+);
+router.get(
+  "/moodmeter/colorcount/:user_id",
+  authenticateToken,
+  verifyUserOwnership,
+  getColorKeywordCount
+);
+router.get(
+  "/moodmeter/label/:user_id",
+  authenticateToken,
+  verifyUserOwnership,
+  getLabelForUser
+);
 
 export default router;

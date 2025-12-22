@@ -5,7 +5,22 @@ import bcrypt from "bcrypt";
 import crypto from "crypto";
 import { put } from "@vercel/blob";
 
-const JWT_SECRET = process.env.JWT_SECRET || "your_secret_key";
+// JWT_SECRET 검증
+const JWT_SECRET = (() => {
+  if (!process.env.JWT_SECRET) {
+    if (process.env.NODE_ENV === "production") {
+      console.error(
+        "⚠️  CRITICAL: JWT_SECRET is not set in production! This is a serious security risk."
+      );
+      process.exit(1);
+    }
+    console.warn(
+      "⚠️  JWT_SECRET not set. Using default for development only!"
+    );
+    return "dev-jwt-secret-change-in-production";
+  }
+  return process.env.JWT_SECRET;
+})();
 
 export const register = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -29,9 +44,39 @@ export const register = async (req: Request, res: Response): Promise<void> => {
     let profile_picture = req.body.profile_picture || null;
 
     if (req.file) {
+      // 파일 타입 검증
+      const allowedTypes = [
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+      ];
+      if (!allowedTypes.includes(req.file.mimetype)) {
+        res.status(400).json({
+          message:
+            "허용되지 않는 파일 형식입니다. JPEG, PNG, GIF, WebP만 허용됩니다.",
+        });
+        return;
+      }
+
+      // 파일 크기 검증 (10MB)
+      if (req.file.size > 10 * 1024 * 1024) {
+        res.status(400).json({
+          message: "프로필 사진 크기는 10MB를 초과할 수 없습니다.",
+        });
+        return;
+      }
+
       try {
+        // 파일명 sanitization
+        const sanitizedFilename = req.file.originalname
+          .replace(/[^a-zA-Z0-9._-]/g, "_")
+          .replace(/\.{2,}/g, "_")
+          .substring(0, 255);
+
         const blob = await put(
-          `profile-pictures/${Date.now()}-${req.file.originalname}`,
+          `profile-pictures/${Date.now()}-${sanitizedFilename}`,
           req.file.buffer,
           {
             access: "public",

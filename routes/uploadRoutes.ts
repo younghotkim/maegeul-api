@@ -1,6 +1,7 @@
 import express from "express";
 import multer from "multer";
 import { uploadFile } from "../controllers/uploadController";
+import { authenticateToken } from "../middleware/auth";
 
 const router = express.Router();
 
@@ -13,6 +14,12 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB 제한
 });
 
-router.post("/upload", upload.single("profile_picture"), uploadFile);
+// File upload requires authentication
+router.post(
+  "/upload",
+  authenticateToken,
+  upload.single("profile_picture"),
+  uploadFile
+);
 
 export default router;

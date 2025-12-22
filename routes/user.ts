@@ -1,6 +1,7 @@
 import express, { Request, Response } from "express";
 import * as userController from "../controllers/userController";
 import multer from "multer";
+import { authenticateToken, verifyUserOwnership } from "../middleware/auth";
 
 const router = express.Router();
 
@@ -12,17 +13,13 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB 제한
 });
 
+// Public routes
 router.post(
   "/register",
   upload.single("profile_picture"),
   userController.register
 );
-
 router.post("/login", userController.login);
-router.get("/user/:user_id", userController.getUser);
-router.put("/user", userController.updateUser);
-router.delete("/user/:user_id", userController.deleteUser);
-
 router.post("/check-email", (req: Request, res: Response) => {
   const { email } = req.body;
 
@@ -45,5 +42,25 @@ router.post("/check-email", (req: Request, res: Response) => {
     res.status(200).json({ message: "Email is available" });
   });
 });
+
+// Protected routes - require authentication
+router.get(
+  "/user/:user_id",
+  authenticateToken,
+  verifyUserOwnership,
+  userController.getUser
+);
+router.put(
+  "/user",
+  authenticateToken,
+  verifyUserOwnership,
+  userController.updateUser
+);
+router.delete(
+  "/user/:user_id",
+  authenticateToken,
+  verifyUserOwnership,
+  userController.deleteUser
+);
 
 export default router;

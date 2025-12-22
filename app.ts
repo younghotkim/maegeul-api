@@ -5,6 +5,8 @@ import passport from "passport";
 import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 
 // 환경 변수 로드 (다른 모듈 import 전에 실행)
 dotenv.config();
@@ -21,6 +23,35 @@ import emotionAnalysisRoutes from "./routes/emotionAnalysisRoutes";
 import "./config/passport";
 
 const app = express();
+
+// 보안 헤더 설정 (Helmet)
+app.use(
+  helmet({
+    contentSecurityPolicy: process.env.NODE_ENV === "production",
+    crossOriginEmbedderPolicy: false,
+  })
+);
+
+// Rate Limiting - DoS 공격 방어
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15분
+  max: 100, // IP당 최대 100개 요청
+  message: "Too many requests from this IP, please try again later.",
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// 로그인 API에 대한 더 강력한 Rate Limiting
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15분
+  max: 5, // IP당 최대 5개 로그인 시도
+  message: "Too many login attempts, please try again later.",
+  skipSuccessfulRequests: true, // 성공한 요청은 카운트하지 않음
+});
+
+app.use("/api/", limiter); // 모든 API 라우트에 적용
+app.use("/api/login", authLimiter); // 로그인 라우트에 추가 제한
+app.use("/api/register", authLimiter); // 회원가입 라우트에 추가 제한
 
 // 미들웨어 설정
 // CORS 설정 - 클라이언트와 서버 분리 배포를 위한 환경 변수 지원
@@ -50,13 +81,32 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Body parser with size limits to prevent DoS attacks
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+// SESSION_SECRET 검증
+if (!process.env.SESSION_SECRET && process.env.NODE_ENV === "production") {
+  console.error(
+    "⚠️  CRITICAL: SESSION_SECRET is not set in production! This is a serious security risk."
+  );
+  process.exit(1);
+}
 
 // 세션 설정
 app.use(
   session({
-    secret: process.env.SESSION_SECRET || "defaultSecret",
+    secret:
+      process.env.SESSION_SECRET ||
+      (() => {
+        if (process.env.NODE_ENV === "production") {
+          throw new Error("SESSION_SECRET must be set in production");
+        }
+        console.warn(
+          "⚠️  Using default session secret in development. Do not use in production!"
+        );
+        return "dev-secret-change-in-production";
+      })(),
     resave: false,
     saveUninitialized: false,
     cookie: {
@@ -67,6 +117,7 @@ app.use(
         process.env.SESSION_DOMAIN && { domain: process.env.SESSION_DOMAIN }),
       httpOnly: true,
       sameSite: process.env.NODE_ENV === "production" ? "strict" : "lax", // 개발 환경에서는 lax 사용
+      maxAge: 24 * 60 * 60 * 1000, // 24시간
     },
   })
 );
