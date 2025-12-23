@@ -7,7 +7,9 @@
     "build": "tsc",
     "start": "node dist/app.js",
     "dev": "nodemon --exec ts-node app.ts",
-    "dev:watch": "nodemon --watch './**/*.ts' --exec 'ts-node' app.ts"
+    "dev:watch": "nodemon --watch './**/*.ts' --exec 'ts-node' app.ts",
+    "test": "vitest --run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2",
@@ -46,9 +48,11 @@
     "@types/node": "^25.0.3",
     "@types/passport": "^1.0.17",
     "@types/passport-kakao": "^1.0.3",
+    "fast-check": "^4.5.2",
     "nodemon": "^2.0.22",
     "prisma": "^5.22.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.16"
   }
 }

@@ -4,6 +4,7 @@ import {
   getMoodMeterForUser,
   getColorKeywordCount,
   getLabelForUser,
+  getRecentMoodColors,
 } from "../controllers/moodController";
 import { authenticateToken, verifyUserOwnership } from "../middleware/auth";
 
@@ -22,6 +23,12 @@ router.get(
   authenticateToken,
   verifyUserOwnership,
   getColorKeywordCount
+);
+router.get(
+  "/moodmeter/color/:user_id",
+  authenticateToken,
+  verifyUserOwnership,
+  getRecentMoodColors
 );
 router.get(
   "/moodmeter/label/:user_id",

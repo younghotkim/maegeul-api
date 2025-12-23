@@ -19,6 +19,7 @@ import moodmeterRoutes from "./routes/moodRoutes";
 import diaryRoutes from "./routes/diaryRoutes";
 import uploadRoutes from "./routes/uploadRoutes";
 import emotionAnalysisRoutes from "./routes/emotionAnalysisRoutes";
+import chatRoutes from "./routes/chatRoutes";
 
 import "./config/passport";
 
@@ -33,18 +34,19 @@ app.use(
 );
 
 // Rate Limiting - DoS 공격 방어
+// 글로벌 서비스를 위해 넉넉하게 설정
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15분
-  max: 100, // IP당 최대 100개 요청
+  max: 1000, // IP당 최대 1000개 요청
   message: "Too many requests from this IP, please try again later.",
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-// 로그인 API에 대한 더 강력한 Rate Limiting
+// 로그인 API에 대한 Rate Limiting (브루트포스 방지)
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15분
-  max: 5, // IP당 최대 5개 로그인 시도
+  max: 50, // IP당 최대 50개 로그인 시도
   message: "Too many login attempts, please try again later.",
   skipSuccessfulRequests: true, // 성공한 요청은 카운트하지 않음
 });
@@ -136,6 +138,7 @@ app.use("/api", kakaoAuthRoutes);
 app.use("/api", moodmeterRoutes);
 app.use("/api", diaryRoutes);
 app.use("/api", emotionAnalysisRoutes);
+app.use("/api", chatRoutes);
 
 // 클라이언트와 서버 분리 배포 지원
 // SERVE_CLIENT_STATIC=true로 설정하면 서버에서 클라이언트 빌드 파일을 서빙 (통합 배포용)
