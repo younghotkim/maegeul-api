@@ -4,12 +4,13 @@
   "description": "maegeul backend",
   "main": "dist/app.js",
   "scripts": {
-    "build": "tsc",
+    "build": "prisma generate && tsc",
     "start": "node dist/app.js",
     "dev": "nodemon --exec ts-node app.ts",
     "dev:watch": "nodemon --watch './**/*.ts' --exec 'ts-node' app.ts",
     "test": "vitest --run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2",
