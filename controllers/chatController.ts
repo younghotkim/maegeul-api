@@ -21,6 +21,10 @@ import {
   generateRAGResponse,
   Message as RAGMessage,
 } from '../services/rag.service';
+import {
+  runGuardrails,
+  sanitizeOutput,
+} from '../services/guardrail.service';
 
 // SSE retry interval in milliseconds
 const SSE_RETRY_INTERVAL = 3000;
@@ -55,6 +59,68 @@ export const sendMessage = async (req: Request, res: Response): Promise<void> =>
     return;
   }
 
+  // Run guardrails on input
+  const guardrailResult = runGuardrails(message);
+  if (!guardrailResult.isAllowed) {
+    // Instead of returning error, stream the guardrail message as a normal response
+    try {
+      // Get or create session
+      let session;
+      if (session_id) {
+        session = await getSessionById(session_id);
+        if (!session || session.user_id !== userId) {
+          res.status(404).json({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
+          return;
+        }
+      } else {
+        session = await getOrCreateSession(userId);
+      }
+
+      // Save user message
+      await saveMessage(session.session_id, 'user', message.trim());
+
+      // Set up SSE headers
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders();
+
+      // Send session info
+      res.write(`event: session\ndata: ${JSON.stringify({ session_id: session.session_id })}\n\n`);
+      res.write(`retry: ${SSE_RETRY_INTERVAL}\n\n`);
+
+      // Stream the guardrail message
+      const guardrailMessage = guardrailResult.reason || '요청을 처리할 수 없어요.';
+      for (const char of guardrailMessage) {
+        res.write(`event: token\ndata: ${JSON.stringify({ token: char })}\n\n`);
+      }
+
+      // Save assistant response
+      await saveMessage(session.session_id, 'assistant', guardrailMessage, []);
+
+      // Send completion event
+      res.write(`event: done\ndata: ${JSON.stringify({ 
+        message_id: session.session_id,
+        diary_ids: [],
+        action: null
+      })}\n\n`);
+
+      res.end();
+      return;
+    } catch (error: any) {
+      console.error('Guardrail response error:', error);
+      res.status(500).json({
+        error: 'Failed to process message',
+        code: 'INTERNAL_ERROR'
+      });
+      return;
+    }
+  }
+
+  // Use sanitized input if available
+  const sanitizedMessage = guardrailResult.sanitizedInput || message.trim();
+
   try {
     // Get or create session
     let session;
@@ -69,7 +135,7 @@ export const sendMessage = async (req: Request, res: Response): Promise<void> =>
     }
 
     // Save user message
-    await saveMessage(session.session_id, 'user', message.trim());
+    await saveMessage(session.session_id, 'user', sanitizedMessage);
 
     // Get chat history for context
     const recentMessages = await getRecentMessages(session.session_id, 10);
@@ -107,7 +173,7 @@ export const sendMessage = async (req: Request, res: Response): Promise<void> =>
       // Generate response with streaming
       const result = await generateRAGResponse(
         userId,
-        message.trim(),
+        sanitizedMessage,
         chatHistory,
         (token: string) => {
           // Check if client disconnected
@@ -125,8 +191,9 @@ export const sendMessage = async (req: Request, res: Response): Promise<void> =>
         profileName
       );
 
-      fullResponse = result.response;
+      fullResponse = sanitizeOutput(result.response);
       diaryIds = result.diaryIds;
+      const action = result.action;
 
       // Handle empty response (Requirement 9.5)
       if (!fullResponse || fullResponse.trim().length === 0) {
@@ -156,7 +223,8 @@ export const sendMessage = async (req: Request, res: Response): Promise<void> =>
       if (!streamingInterrupted) {
         res.write(`event: done\ndata: ${JSON.stringify({ 
           message_id: session.session_id,
-          diary_ids: diaryIds 
+          diary_ids: diaryIds,
+          action: action || null
         })}\n\n`);
       }
 

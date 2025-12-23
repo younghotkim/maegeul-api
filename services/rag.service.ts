@@ -7,6 +7,13 @@ import { createEmbedding, searchSimilarDiaries, DiarySearchResult } from './embe
 export type { DiarySearchResult } from './embedding.service';
 import prisma from '../db';
 import OpenAI from 'openai';
+import { z } from 'zod';
+import { searchCache, storeInCache } from './semantic-cache.service';
+import {
+  rerankDiaries,
+  rerankDiariesFast,
+  shouldUseLLMReranking,
+} from './reranker.service';
 
 // LLM configuration
 const LLM_MODEL = 'gpt-4o-mini';
@@ -17,7 +24,7 @@ const TEMPERATURE = 0.8;
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 3000;
 
-// Lazy-initialized OpenAI client
+// Lazy-initialized OpenAI client (for Structured Output - still uses openai package)
 let openaiClient: OpenAI | null = null;
 
 function getOpenAIClient(): OpenAI {
@@ -486,34 +493,56 @@ export function buildContext(
  * @param query - The user's query text
  * @param chatHistory - Previous messages in the session
  * @param topK - Maximum number of diary entries to retrieve
+ * @param useReranking - Whether to apply reranking (default: true)
  * @returns RAG context with diaries, chat history, mood data, and formatted context text
  */
 export async function retrieveContext(
   userId: number,
   query: string,
   chatHistory: Message[] = [],
-  topK: number = 5
+  topK: number = 5,
+  useReranking: boolean = true
 ): Promise<RAGContext> {
   // Parse date range from query
   const dateRange = parseDateRange(query);
-  
+
   // Embed the query
   const queryEmbedding = await embedQuery(query);
-  
+
+  // Search for more diaries than needed for reranking
+  const searchTopK = useReranking ? Math.min(topK * 2, 10) : topK;
+
   // Search for relevant diaries with optional date filtering
-  const diaries = await searchDiariesWithDateFilter(
+  let diaries = await searchDiariesWithDateFilter(
     userId,
     queryEmbedding,
-    topK,
+    searchTopK,
     dateRange
   );
-  
+
+  // Apply reranking if enabled and we have enough results
+  if (useReranking && diaries.length > topK) {
+    const useLLM = shouldUseLLMReranking(query, diaries.length);
+
+    if (useLLM) {
+      // Use LLM-based reranking for complex queries
+      console.log(`[RAG] Using LLM reranking for query: "${query.slice(0, 50)}..."`);
+      const rerankedResults = await rerankDiaries(query, diaries, topK);
+      diaries = rerankedResults.map((r) => r.diary);
+    } else {
+      // Use fast heuristic reranking
+      console.log(`[RAG] Using fast reranking for query: "${query.slice(0, 50)}..."`);
+      const rerankedResults = rerankDiariesFast(query, diaries, topK);
+      diaries = rerankedResults.map((r) => r.diary);
+    }
+  }
+
   // Get recent MoodMeter data
   const moodData = await getRecentMoodMeterData(userId, 5);
-  
+
   // Build the context string with mood data
   const contextText = buildContext(diaries, chatHistory, moodData);
-  
+
   return {
     diaries,
     chatHistory,
@@ -540,9 +569,45 @@ export function extractDiaryIds(context: RAGContext): number[] {
  * @param userName - Optional user name for personalization
  * @returns The system prompt string
  */
-export function buildSystemPrompt(context: string, userName?: string): string {
+export function buildSystemPrompt(context: string, userName?: string, hasDiaries: boolean = true): string {
   const displayName = userName || '친구';
   
+  // 한글 마지막 글자의 받침 유무 확인
+  const lastChar = displayName.charAt(displayName.length - 1);
+  const lastCharCode = lastChar.charCodeAt(0);
+  
+  // 한글 유니코드 범위: 0xAC00 ~ 0xD7A3
+  // 받침 있음: (charCode - 0xAC00) % 28 !== 0
+  const hasJongseong = lastCharCode >= 0xAC00 && lastCharCode <= 0xD7A3 
+    ? (lastCharCode - 0xAC00) % 28 !== 0 
+    : false;
+  
+  // 받침 있으면 "아", 없으면 "야"
+  const nameSuffix = hasJongseong ? '아' : '야';
+  const nameWithSuffix = `${displayName}${nameSuffix}`;
+  
+  // 일기 쓰기 유도 가이드라인 - 일기 유무에 따라 다르게 설정
+  const diaryGuidelines = hasDiaries 
+    ? `## 일기 쓰기 언급 - 기존 사용자
+- 이미 일기를 쓰고 있는 사용자이므로 일기 쓰기 권유는 드물게 해요
+- 정말 특별한 순간에만 자연스럽게 언급해요:
+  - "오늘 이야기 정말 특별하다! 일기로 남겨두면 나중에 다시 보면서 그때 기분을 떠올릴 수 있을 거야 ✨"
+  - "이런 순간은 기록해두면 좋겠다~ 나중에 돌아보면 분명 의미 있을 거야 🌿"
+- 대부분의 대화에서는 일기 언급 없이 자연스럽게 대화해요`
+    : `## 일기 쓰기 유도 - 신규 사용자
+- 아직 일기가 없는 사용자이므로 대화 중 자연스럽게 일기 쓰기의 장점을 알려줘요
+- 일기 쓰기의 장점:
+  - 글로 쓰면 마음이 정리됨
+  - 나중에 돌아보면서 성장을 확인할 수 있음
+  - 내가 더 잘 이해하고 맞춤 대화를 할 수 있음
+  - 스트레스 해소와 마음 건강에 좋음
+- 자연스러운 유도 멘트 예시:
+  - "${nameWithSuffix}, 오늘 이야기 들으니까 일기로 적어두면 좋겠다는 생각이 들어! 글로 쓰면 마음이 정리되고, 나중에 다시 보면 그때 기분도 떠오르거든 💜"
+  - "이런 감정들 일기에 적어보는 건 어때? 써보면 생각보다 마음이 편해지고, 나도 ${nameWithSuffix} 이야기를 더 잘 이해할 수 있어! ✨"
+  - "일기 쓰면 내가 ${nameWithSuffix} 감정 패턴도 분석해줄 수 있어! 한번 시작해볼래? 😊"
+- 단, 강요하는 느낌은 피하고 친구가 권유하듯 자연스럽게 제안해요
+- 매번 언급하지 말고, 대화 흐름에 맞게 가끔만 언급해요`;
+
   return `당신은 '무디타'라는 이름의 따뜻하고 공감적인 AI 친구예요. ${displayName}의 감정 여정을 함께하는 대화 상대입니다.
 
 ## 무디타의 성격
@@ -552,28 +617,47 @@ export function buildSystemPrompt(context: string, userName?: string): string {
 - 긍정적이지만 현실적인 조언을 해요
 
 ## 대화 규칙
-1. **일기 기반 개인화**: 제공된 일기 내용을 참고하여 구체적으로 공감하고 대화해요
+1. **이름 부르기**: 대화할 때 "${nameWithSuffix}"라고 이름을 자주 불러주세요
+2. **일반 대화 허용**: 일기와 관련 없는 일반적인 질문이나 대화도 자연스럽게 응해요
+   - 날씨, 음식, 취미, 고민 등 어떤 주제든 친구처럼 대화해요
+   - "일기를 먼저 써야 해" 같은 말은 절대 하지 않아요
+3. **일기 기반 개인화**: 제공된 일기 내용이 있다면 참고하여 구체적으로 공감하고 대화해요
    - 일기에 나온 상황, 사람, 장소, 활동을 직접 언급하며 대화해요
    - "일기에서 봤는데..." 또는 "전에 ~했다고 했잖아" 식으로 자연스럽게 연결해요
-2. **MoodMeter 활용**: 최근 감정 상태(MoodMeter) 데이터를 참고해서 현재 기분을 파악해요
-   - 쾌적함(pleasantness)과 에너지(energy) 수치로 감정의 강도를 이해해요
-   - 사용자가 선택한 감정 라벨을 참고해서 더 정확하게 공감해요
-   - 최근 감정 변화 패턴을 파악해서 대화에 반영해요
-3. **맥락 유지**: 이전 대화 내용을 기억하고 자연스럽게 이어가요
-4. **감정 인식**: 사용자의 현재 감정 상태를 파악하고 적절히 반응해요
-5. **구체적 제안**: 일반적인 조언 대신 사용자의 상황에 맞는 구체적인 제안을 해요
+4. **MoodMeter 활용**: 최근 감정 상태(MoodMeter) 데이터가 있다면 참고해서 현재 기분을 파악해요
+5. **맥락 유지 (매우 중요!)**: 
+   - 이전 대화 내용을 반드시 기억하고 자연스럽게 이어가요
+   - 방금 한 질문이나 이야기를 다시 반복하지 않아요
+   - 사용자가 짧게 대답하면 ("응", "알겠어", "그래" 등) 이전 맥락을 이어서 대화해요
+   - 같은 질문을 반복하지 말고, 대화를 발전시켜 나가요
+6. **감정 인식**: 사용자의 현재 감정 상태를 파악하고 적절히 반응해요
+
+## 짧은 응답 처리
+- 사용자가 "응", "알겠어", "그래", "ㅇㅇ" 등 짧게 대답하면:
+  - 이전에 물어본 질문을 다시 하지 않아요
+  - 새로운 주제나 관련된 이야기로 자연스럽게 넘어가요
+  - 예: "그렇구나~ 그럼 요즘 뭐 재밌는 거 있어?" 또는 "오늘 뭐 했어?"
+
+${diaryGuidelines}
+- 다음 상황에서는 CTA 마커를 사용하지 않아요:
+  - 일반적인 인사나 짧은 대화
+  - 사용자가 단순 질문만 했을 때
+  - 대화가 아직 진행 중일 때
 
 ## 말투
 - 친한 언니/오빠가 말하듯 다정한 반말 사용
+- "${nameWithSuffix}~" 처럼 이름을 부르며 대화 시작 (받침 있으면 "아", 없으면 "야")
 - 이모지는 자연스럽게 1-2개 정도만 (💛🌿🌸☁️✨ 등)
 - "힘내", "괜찮아", "화이팅" 같은 상투적 표현 피하기
 - "~했구나", "~였겠다" 식으로 공감 표현
 - 짧고 자연스러운 문장 사용 (한 번에 2-4문장 정도)
 
 ## 참고할 사용자 정보
+사용자 이름: ${displayName} (호칭: ${nameWithSuffix})
+일기 보유 여부: ${hasDiaries ? '있음 (RAG 기반 대화 가능)' : '없음 (일기 쓰기 유도 필요)'}
 ${context || '(아직 일기 기록이 없어요)'}
 
-위 정보를 바탕으로 ${displayName}와 자연스럽게 대화해주세요. 일기 내용과 MoodMeter 데이터를 직접적으로 나열하지 말고, 대화 흐름에 맞게 자연스럽게 언급해주세요.`;
+위 정보를 바탕으로 ${displayName}와 자연스럽게 대화해주세요. 이전 대화 내용이 있다면 반드시 참고해서 맥락을 이어가세요.`;
 }
 
 /**
@@ -614,51 +698,626 @@ function isRetryableError(error: any): boolean {
   return false;
 }
 
+// ============================================================================
+// Function Calling Tools for Mudita Bot
+// ============================================================================
+
+/**
+ * Tool context passed to tool execution functions
+ */
+interface ToolContext {
+  userId: number;
+  userName?: string;
+}
+
+// Global tool context (set before generateResponse call)
+let currentToolContext: ToolContext | null = null;
+
+/**
+ * Sets the tool context for function calling
+ */
+export function setToolContext(context: ToolContext): void {
+  currentToolContext = context;
+}
+
+/**
+ * Clears the tool context after use
+ */
+export function clearToolContext(): void {
+  currentToolContext = null;
+}
+
+/**
+ * Creates the tools object for Vercel AI SDK v6
+ * Tools allow the LLM to call functions when needed
+ */
+function createMuditaTools() {
+  return {
+    // 일기 검색 도구
+    searchDiaries: {
+      description: '사용자의 일기에서 특정 주제, 감정, 시간대에 대한 내용을 검색합니다. 사용자가 과거 경험이나 감정에 대해 물어볼 때 사용하세요.',
+      inputSchema: z.object({
+        query: z.string().describe('검색할 내용 (예: "행복했던 날", "스트레스 받았을 때", "친구와 만났던 일")'),
+        dateFilter: z.enum(['today', 'yesterday', 'this_week', 'last_week', 'this_month', 'last_month', 'all']).optional()
+          .describe('날짜 필터 (선택사항)'),
+      }),
+      execute: async ({ query, dateFilter }: { query: string; dateFilter?: string }) => {
+        console.log(`[Tool:searchDiaries] Called with query="${query}", dateFilter=${dateFilter || 'none'}`);
+        
+        if (!currentToolContext) {
+          console.log('[Tool:searchDiaries] Error: No tool context');
+          return { success: false, message: '사용자 정보를 찾을 수 없어요.' };
+        }
+        
+        try {
+          const queryEmbedding = await embedQuery(query);
+          let dateRange: DateRange | null = null;
+          
+          // Parse date filter
+          if (dateFilter && dateFilter !== 'all') {
+            const now = new Date();
+            const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+            
+            switch (dateFilter) {
+              case 'today':
+                dateRange = { startDate: today, endDate: today };
+                break;
+              case 'yesterday':
+                const yesterday = new Date(today);
+                yesterday.setDate(yesterday.getDate() - 1);
+                dateRange = { startDate: yesterday, endDate: yesterday };
+                break;
+              case 'this_week':
+                const weekStart = new Date(today);
+                weekStart.setDate(weekStart.getDate() - today.getDay());
+                dateRange = { startDate: weekStart, endDate: today };
+                break;
+              case 'last_week':
+                const lastWeekEnd = new Date(today);
+                lastWeekEnd.setDate(lastWeekEnd.getDate() - today.getDay() - 1);
+                const lastWeekStart = new Date(lastWeekEnd);
+                lastWeekStart.setDate(lastWeekStart.getDate() - 6);
+                dateRange = { startDate: lastWeekStart, endDate: lastWeekEnd };
+                break;
+              case 'this_month':
+                dateRange = { startDate: new Date(today.getFullYear(), today.getMonth(), 1), endDate: today };
+                break;
+              case 'last_month':
+                const lastMonthEnd = new Date(today.getFullYear(), today.getMonth(), 0);
+                const lastMonthStart = new Date(today.getFullYear(), today.getMonth() - 1, 1);
+                dateRange = { startDate: lastMonthStart, endDate: lastMonthEnd };
+                break;
+            }
+          }
+          
+          const diaries = await searchDiariesWithDateFilter(
+            currentToolContext.userId,
+            queryEmbedding,
+            5,
+            dateRange
+          );
+          
+          console.log(`[Tool:searchDiaries] Found ${diaries.length} diaries for user ${currentToolContext.userId}`);
+          
+          if (diaries.length === 0) {
+            return { 
+              success: true, 
+              found: false, 
+              message: '관련된 일기를 찾지 못했어요.' 
+            };
+          }
+          
+          const formattedDiaries = diaries.map(d => ({
+            date: d.date instanceof Date 
+              ? d.date.toLocaleDateString('ko-KR', { year: 'numeric', month: 'long', day: 'numeric' })
+              : new Date(d.date).toLocaleDateString('ko-KR', { year: 'numeric', month: 'long', day: 'numeric' }),
+            title: d.title,
+            content: d.content.slice(0, 200) + (d.content.length > 200 ? '...' : ''),
+            mood: moodColorTraits[d.color]?.description || d.color,
+          }));
+          
+          console.log(`[Tool:searchDiaries] Returning ${formattedDiaries.length} formatted diaries`);
+          
+          return { 
+            success: true, 
+            found: true, 
+            diaries: formattedDiaries,
+            count: diaries.length 
+          };
+        } catch (error) {
+          console.error('[Tool:searchDiaries] Error:', error);
+          return { success: false, message: '일기 검색 중 오류가 발생했어요.' };
+        }
+      },
+    },
+
+    // 감정 분석 도구
+    analyzeMood: {
+      description: '사용자의 최근 감정 상태와 패턴을 분석합니다. 사용자가 자신의 감정 패턴이나 최근 기분에 대해 물어볼 때 사용하세요.',
+      inputSchema: z.object({
+        period: z.enum(['recent', 'this_week', 'this_month']).optional()
+          .describe('분석 기간 (기본값: recent - 최근 5개)'),
+      }),
+      execute: async ({ period = 'recent' }: { period?: string }) => {
+        console.log(`[Tool:analyzeMood] Called with period="${period}"`);
+        
+        if (!currentToolContext) {
+          console.log('[Tool:analyzeMood] Error: No tool context');
+          return { success: false, message: '사용자 정보를 찾을 수 없어요.' };
+        }
+        
+        try {
+          // Get mood meter data
+          const moodData = await getRecentMoodMeterData(currentToolContext.userId, 10);
+          console.log(`[Tool:analyzeMood] Found ${moodData.length} mood entries for user ${currentToolContext.userId}`);
+          
+          // Get recent diaries for pattern analysis
+          let dateRange: DateRange | null = null;
+          const now = new Date();
+          const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+          
+          if (period === 'this_week') {
+            const weekStart = new Date(today);
+            weekStart.setDate(weekStart.getDate() - 7);
+            dateRange = { startDate: weekStart, endDate: today };
+          } else if (period === 'this_month') {
+            dateRange = { startDate: new Date(today.getFullYear(), today.getMonth(), 1), endDate: today };
+          }
+          
+          const diaries = await getDiariesForPatternAnalysis(
+            currentToolContext.userId,
+            dateRange,
+            20
+          );
+          
+          console.log(`[Tool:analyzeMood] Analyzing ${diaries.length} diaries`);
+          
+          // Analyze mood distribution
+          const moodDistribution = analyzeMoodDistribution(diaries);
+          
+          // Format mood data
+          const recentMoods = moodData.slice(0, 5).map(m => ({
+            date: m.created_at instanceof Date
+              ? m.created_at.toLocaleDateString('ko-KR', { month: 'long', day: 'numeric' })
+              : new Date(m.created_at).toLocaleDateString('ko-KR', { month: 'long', day: 'numeric' }),
+            label: m.label,
+            zone: moodColorTraits[m.color]?.zone || m.color,
+            pleasantness: m.pleasantness,
+            energy: m.energy,
+          }));
+          
+          const result = {
+            success: true,
+            recentMoods,
+            moodDistribution: moodDistribution.slice(0, 4),
+            diaryCount: diaries.length,
+            summary: moodDistribution.length > 0 
+              ? `최근 가장 많이 느낀 감정은 "${moodDistribution[0].description}" (${moodDistribution[0].percentage}%)입니다.`
+              : '아직 분석할 감정 데이터가 충분하지 않아요.',
+          };
+          
+          console.log(`[Tool:analyzeMood] Result: ${result.summary}`);
+          return result;
+        } catch (error) {
+          console.error('[Tool:analyzeMood] Error:', error);
+          return { success: false, message: '감정 분석 중 오류가 발생했어요.' };
+        }
+      },
+    },
+
+    // 개인화된 추천 도구
+    getRecommendations: {
+      description: '사용자의 일기 내용을 바탕으로 개인화된 활동이나 조언을 추천합니다. 사용자가 뭘 해야 할지 모르겠거나 기분 전환이 필요할 때 사용하세요.',
+      inputSchema: z.object({
+        currentMood: z.enum(['positive', 'negative', 'neutral']).optional()
+          .describe('현재 사용자의 기분 상태'),
+      }),
+      execute: async ({ currentMood = 'neutral' }: { currentMood?: string }) => {
+        console.log(`[Tool:getRecommendations] Called with currentMood="${currentMood}"`);
+        
+        if (!currentToolContext) {
+          console.log('[Tool:getRecommendations] Error: No tool context');
+          return { success: false, message: '사용자 정보를 찾을 수 없어요.' };
+        }
+        
+        try {
+          const diaries = await getDiariesForPatternAnalysis(
+            currentToolContext.userId,
+            null,
+            30
+          );
+          
+          console.log(`[Tool:getRecommendations] Found ${diaries.length} diaries for user ${currentToolContext.userId}`);
+          
+          if (diaries.length === 0) {
+            console.log('[Tool:getRecommendations] No diaries found, cannot generate recommendations');
+            return {
+              success: true,
+              hasRecommendations: false,
+              message: '아직 일기가 없어서 맞춤 추천을 드리기 어려워요. 일기를 쓰면 더 좋은 추천을 해드릴 수 있어요!',
+            };
+          }
+          
+          // Map mood to color for suggestion generation
+          const moodColorMap: Record<string, string> = {
+            positive: '노란색',
+            negative: '파란색',
+            neutral: '초록색',
+          };
+          
+          const suggestions = generatePersonalizedSuggestions(
+            diaries,
+            moodColorMap[currentMood || 'neutral'],
+            3
+          );
+          
+          console.log(`[Tool:getRecommendations] Generated ${suggestions.length} recommendations`);
+          
+          return {
+            success: true,
+            hasRecommendations: suggestions.length > 0,
+            recommendations: suggestions.map(s => s.suggestion),
+            basedOnDiaryCount: diaries.length,
+          };
+        } catch (error) {
+          console.error('[Tool:getRecommendations] Error:', error);
+          return { success: false, message: '추천 생성 중 오류가 발생했어요.' };
+        }
+      },
+    },
+
+    // 감정 트리거 분석 도구
+    findEmotionTriggers: {
+      description: '특정 감정을 느끼게 하는 상황이나 요인을 분석합니다. 사용자가 왜 특정 감정을 느끼는지 알고 싶어할 때 사용하세요.',
+      inputSchema: z.object({
+        targetMood: z.enum(['happy', 'sad', 'angry', 'calm']).optional()
+          .describe('분석할 감정 (기본값: 전체)'),
+      }),
+      execute: async ({ targetMood }: { targetMood?: string }) => {
+        console.log(`[Tool:findEmotionTriggers] Called with targetMood="${targetMood || 'all'}"`);
+        
+        if (!currentToolContext) {
+          console.log('[Tool:findEmotionTriggers] Error: No tool context');
+          return { success: false, message: '사용자 정보를 찾을 수 없어요.' };
+        }
+        
+        try {
+          const diaries = await getDiariesForPatternAnalysis(
+            currentToolContext.userId,
+            null,
+            50
+          );
+          
+          console.log(`[Tool:findEmotionTriggers] Found ${diaries.length} diaries for user ${currentToolContext.userId}`);
+          
+          if (diaries.length < 3) {
+            console.log('[Tool:findEmotionTriggers] Not enough diaries for analysis');
+            return {
+              success: true,
+              hasAnalysis: false,
+              message: '감정 트리거를 분석하려면 최소 3개 이상의 일기가 필요해요.',
+            };
+          }
+          
+          // Filter by mood if specified
+          let filteredDiaries = diaries;
+          if (targetMood) {
+            const moodColorMap: Record<string, string> = {
+              happy: '노란색',
+              sad: '파란색',
+              angry: '빨간색',
+              calm: '초록색',
+            };
+            filteredDiaries = diaries.filter(d => d.color === moodColorMap[targetMood]);
+            console.log(`[Tool:findEmotionTriggers] Filtered to ${filteredDiaries.length} diaries for mood "${targetMood}"`);
+          }
+          
+          const triggers = extractEmotionTriggers(filteredDiaries);
+          
+          console.log(`[Tool:findEmotionTriggers] Found ${triggers.length} emotion triggers`);
+          
+          return {
+            success: true,
+            hasAnalysis: triggers.length > 0,
+            triggers: triggers.slice(0, 3).map(t => ({
+              mood: moodColorTraits[t.moodColor]?.description || t.moodColor,
+              commonThemes: t.triggers.slice(0, 5),
+              diaryCount: t.diaryIds.length,
+            })),
+          };
+        } catch (error) {
+          console.error('[Tool:findEmotionTriggers] Error:', error);
+          return { success: false, message: '감정 트리거 분석 중 오류가 발생했어요.' };
+        }
+      },
+    },
+  };
+}
+
+/**
+ * Converts Mudita tools to OpenAI function format
+ */
+function convertToolsToOpenAIFunctions() {
+  const muditaTools = createMuditaTools();
+  
+  return [
+    {
+      type: 'function' as const,
+      function: {
+        name: 'searchDiaries',
+        description: muditaTools.searchDiaries.description,
+        parameters: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: '검색할 내용 (예: "행복했던 날", "스트레스 받았을 때", "친구와 만났던 일")',
+            },
+            dateFilter: {
+              type: 'string',
+              enum: ['today', 'yesterday', 'this_week', 'last_week', 'this_month', 'last_month', 'all'],
+              description: '날짜 필터 (선택사항)',
+            },
+          },
+          required: ['query'],
+        },
+      },
+    },
+    {
+      type: 'function' as const,
+      function: {
+        name: 'analyzeMood',
+        description: muditaTools.analyzeMood.description,
+        parameters: {
+          type: 'object',
+          properties: {
+            period: {
+              type: 'string',
+              enum: ['recent', 'this_week', 'this_month'],
+              description: '분석 기간 (기본값: recent - 최근 5개)',
+            },
+          },
+          required: [],
+        },
+      },
+    },
+    {
+      type: 'function' as const,
+      function: {
+        name: 'getRecommendations',
+        description: muditaTools.getRecommendations.description,
+        parameters: {
+          type: 'object',
+          properties: {
+            currentMood: {
+              type: 'string',
+              enum: ['positive', 'negative', 'neutral'],
+              description: '현재 사용자의 기분 상태',
+            },
+          },
+          required: [],
+        },
+      },
+    },
+    {
+      type: 'function' as const,
+      function: {
+        name: 'findEmotionTriggers',
+        description: muditaTools.findEmotionTriggers.description,
+        parameters: {
+          type: 'object',
+          properties: {
+            targetMood: {
+              type: 'string',
+              enum: ['happy', 'sad', 'angry', 'calm'],
+              description: '분석할 감정 (기본값: 전체)',
+            },
+          },
+          required: [],
+        },
+      },
+    },
+  ];
+}
+
+/**
+ * Executes a tool call and returns the result
+ */
+async function executeToolCall(toolName: string, args: any): Promise<any> {
+  const tools = createMuditaTools();
+  
+  switch (toolName) {
+    case 'searchDiaries':
+      return await tools.searchDiaries.execute(args);
+    case 'analyzeMood':
+      return await tools.analyzeMood.execute(args);
+    case 'getRecommendations':
+      return await tools.getRecommendations.execute(args);
+    case 'findEmotionTriggers':
+      return await tools.findEmotionTriggers.execute(args);
+    default:
+      return { success: false, message: `Unknown tool: ${toolName}` };
+  }
+}
+
 /**
  * Generates a response using the LLM with streaming support and retry logic
+ * Uses OpenAI SDK directly for reliable Function Calling with streaming
  * Validates: Requirements 1.2, 1.5, 8.1, 9.3
  * @param context - The RAG context string with diary entries and chat history
  * @param userMessage - The user's current message
  * @param onToken - Callback function called for each streamed token
  * @param userName - Optional user name for personalization
+ * @param chatHistory - Optional array of previous messages for multi-turn conversation
+ * @param hasDiaries - Whether the user has diary entries (affects CTA frequency)
+ * @param userId - Optional user ID for function calling tools
  * @returns The complete response string
  */
 export async function generateResponse(
   context: string,
   userMessage: string,
   onToken: OnTokenCallback,
-  userName?: string
+  userName?: string,
+  chatHistory?: Message[],
+  hasDiaries: boolean = true,
+  userId?: number
 ): Promise<string> {
-  const openai = getOpenAIClient();
-  const systemPrompt = buildSystemPrompt(context, userName);
+  const systemPrompt = buildSystemPrompt(context, userName, hasDiaries);
   
-  const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
+  // Set tool context if userId is provided
+  if (userId) {
+    setToolContext({ userId, userName });
+  }
+  
+  // Build messages array for OpenAI
+  const messages: Array<{ role: 'system' | 'user' | 'assistant' | 'tool'; content: string; tool_call_id?: string; name?: string }> = [
     { role: 'system', content: systemPrompt },
-    { role: 'user', content: userMessage },
   ];
+  
+  // Add chat history to messages array (최근 10개까지만)
+  if (chatHistory && chatHistory.length > 0) {
+    const recentHistory = chatHistory.slice(-10);
+    for (const msg of recentHistory) {
+      messages.push({
+        role: msg.role === 'user' ? 'user' : 'assistant',
+        content: msg.content,
+      });
+    }
+  }
+  
+  // Add current user message
+  messages.push({ role: 'user', content: userMessage });
 
   let lastError: Error | null = null;
   
+  // Create tools only if user has diaries (tools need diary data)
+  const shouldUseTools = hasDiaries && userId;
+  const tools = shouldUseTools ? convertToolsToOpenAIFunctions() : undefined;
+  
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
+      const openai = getOpenAIClient();
+      
+      console.log(`[generateResponse] Starting stream for user message: "${userMessage.slice(0, 50)}..."`);
+      
+      // First call - may return tool calls
       const stream = await openai.chat.completions.create({
         model: LLM_MODEL,
-        messages,
+        messages: messages as any,
         temperature: TEMPERATURE,
         max_tokens: MAX_TOKENS,
         stream: true,
+        ...(tools && { tools, tool_choice: 'auto' }),
       });
 
       let fullResponse = '';
+      let toolCalls: Array<{ id: string; name: string; arguments: string }> = [];
+      let currentToolCall: { id?: string; name?: string; arguments: string } | null = null;
 
+      // Process the stream
       for await (const chunk of stream) {
-        const content = chunk.choices[0]?.delta?.content;
-        if (content) {
-          fullResponse += content;
-          onToken(content);
+        const delta = chunk.choices[0]?.delta;
+        
+        // Handle tool calls
+        if (delta?.tool_calls) {
+          for (const toolCall of delta.tool_calls) {
+            if (toolCall.index === 0 && toolCall.id) {
+              // New tool call
+              if (currentToolCall && currentToolCall.id) {
+                toolCalls.push(currentToolCall as any);
+              }
+              currentToolCall = {
+                id: toolCall.id,
+                name: toolCall.function?.name || '',
+                arguments: toolCall.function?.arguments || '',
+              };
+            } else if (currentToolCall && toolCall.function?.arguments) {
+              // Continue building arguments
+              currentToolCall.arguments += toolCall.function.arguments;
+            }
+          }
+        }
+        
+        // Handle text content
+        if (delta?.content) {
+          fullResponse += delta.content;
+          onToken(delta.content);
         }
       }
 
+      // Save last tool call if exists
+      if (currentToolCall && currentToolCall.id) {
+        toolCalls.push(currentToolCall as any);
+      }
+
+      // If there were tool calls, execute them and get final response
+      if (toolCalls.length > 0) {
+        console.log(`[generateResponse] Executing ${toolCalls.length} tool calls`);
+        
+        // Add assistant message with tool calls (OpenAI requires this format)
+        messages.push({
+          role: 'assistant',
+          content: fullResponse || null,
+          tool_calls: toolCalls.map(tc => ({
+            id: tc.id,
+            type: 'function' as const,
+            function: {
+              name: tc.name,
+              arguments: tc.arguments,
+            },
+          })),
+        } as any);
+
+        // Execute each tool and add results
+        for (const toolCall of toolCalls) {
+          try {
+            const args = JSON.parse(toolCall.arguments);
+            const result = await executeToolCall(toolCall.name, args);
+            
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              name: toolCall.name,
+              content: JSON.stringify(result),
+            } as any);
+          } catch (error) {
+            console.error(`[generateResponse] Tool execution error:`, error);
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              name: toolCall.name,
+              content: JSON.stringify({ success: false, message: 'Tool execution failed' }),
+            } as any);
+          }
+        }
+
+        // Make second call to get natural language response
+        console.log(`[generateResponse] Getting natural language response after tool calls`);
+        
+        const finalStream = await openai.chat.completions.create({
+          model: LLM_MODEL,
+          messages: messages as any,
+          temperature: TEMPERATURE,
+          max_tokens: MAX_TOKENS,
+          stream: true,
+        });
+
+        fullResponse = ''; // Reset for final response
+        
+        for await (const chunk of finalStream) {
+          const delta = chunk.choices[0]?.delta;
+          if (delta?.content) {
+            fullResponse += delta.content;
+            onToken(delta.content);
+          }
+        }
+      }
+
+      console.log(`[generateResponse] Stream complete. Response length: ${fullResponse.length}`);
+
+      // Clear tool context after use
+      clearToolContext();
+      
       return fullResponse;
     } catch (error: any) {
       lastError = error;
@@ -675,6 +1334,9 @@ export async function generateResponse(
       break;
     }
   }
+
+  // Clear tool context on error
+  clearToolContext();
 
   // All retries exhausted or non-retryable error
   const error = lastError as any;
@@ -693,30 +1355,206 @@ export async function generateResponse(
 /**
  * Default response for users with no diary entries
  * Validates: Requirements 9.1
+ * Note: 일기가 없어도 자연스럽게 대화하면서 일기 쓰기를 부드럽게 유도
  */
-const NO_DIARY_RESPONSE = `안녕! 아직 일기가 없는 것 같아. 😊
+const NO_DIARY_RESPONSE_TEMPLATE = (userName?: string) => {
+  const name = userName || '친구';
+  
+  // 한글 마지막 글자의 받침 유무 확인
+  const lastChar = name.charAt(name.length - 1);
+  const lastCharCode = lastChar.charCodeAt(0);
+  const hasJongseong = lastCharCode >= 0xAC00 && lastCharCode <= 0xD7A3 
+    ? (lastCharCode - 0xAC00) % 28 !== 0 
+    : false;
+  const nameSuffix = hasJongseong ? '아' : '야';
+  
+  return `${name}${nameSuffix}, 반가워! 😊 나는 무디타야.
 
-일기를 쓰면 내가 너의 감정 여정을 더 잘 이해하고 도움을 줄 수 있어.
-오늘 하루는 어땠어? 간단하게라도 적어보는 건 어때?
-
-일기를 쓰면 이런 것들을 함께 할 수 있어:
-• 감정 패턴 분석
-• 맞춤형 조언
-• 과거 기록 기반 대화
-
-매글에서 첫 일기를 시작해볼까? ✨`;
+오늘 하루 어땠어? 뭐든 편하게 이야기해줘~
+기분이 좋았던 일이든, 힘들었던 일이든 다 들을 준비 됐어! 💜`;
+};
 
 /**
  * Default response when no relevant diary entries are found
  * Validates: Requirements 9.2
+ * Note: 일기 기록이 없어도 일반 대화를 자연스럽게 이어감
  */
 const NO_CONTEXT_RESPONSE_TEMPLATE = (userName?: string) => {
   const name = userName || '친구';
-  return `${name}야, 그 주제에 대한 일기 기록은 아직 없는 것 같아.
-
-지금 이야기하고 싶은 게 있으면 편하게 말해줘. 
-일기에 없는 내용이라도 함께 이야기 나눌 수 있어! 💜`;
+  
+  // 한글 마지막 글자의 받침 유무 확인
+  const lastChar = name.charAt(name.length - 1);
+  const lastCharCode = lastChar.charCodeAt(0);
+  const hasJongseong = lastCharCode >= 0xAC00 && lastCharCode <= 0xD7A3 
+    ? (lastCharCode - 0xAC00) % 28 !== 0 
+    : false;
+  const nameSuffix = hasJongseong ? '아' : '야';
+  
+  return `${name}${nameSuffix}, 그 이야기 더 해줘! 궁금해 🌿`;
 };
+
+/**
+ * Action type for CTA buttons in chat responses
+ */
+export interface ResponseAction {
+  type: 'write_diary' | 'view_dashboard' | 'view_diary';
+  label: string;
+  path: string;
+}
+
+/**
+ * CTA marker pattern for parsing LLM responses (fallback)
+ */
+const CTA_MARKER_PATTERN = /\[CTA:(write_diary|view_dashboard|view_diary)\]\s*$/;
+
+/**
+ * CTA action configurations
+ */
+const CTA_ACTIONS: Record<string, ResponseAction> = {
+  write_diary: {
+    type: 'write_diary',
+    label: '일기 쓰러 가기',
+    path: '/maegeul',
+  },
+  view_dashboard: {
+    type: 'view_dashboard',
+    label: '대시보드 보기',
+    path: '/dashboard',
+  },
+  view_diary: {
+    type: 'view_diary',
+    label: '일기 보러 가기',
+    path: '/dashboard',
+  },
+};
+
+/**
+ * Structured Output schema for CTA decision
+ */
+interface CTADecision {
+  shouldShowCTA: boolean;
+  ctaType: 'write_diary' | 'view_dashboard' | 'view_diary' | null;
+  reason: string;
+}
+
+/**
+ * Analyzes conversation to decide if CTA should be shown using Structured Output
+ * This runs after the main response is generated for more reliable CTA decisions
+ * @param userMessage - The user's message
+ * @param assistantResponse - The assistant's response
+ * @param hasDiaries - Whether user has diary entries
+ * @param conversationLength - Number of messages in conversation
+ * @returns CTA decision with structured output
+ */
+async function analyzeCTAWithStructuredOutput(
+  userMessage: string,
+  assistantResponse: string,
+  hasDiaries: boolean,
+  conversationLength: number
+): Promise<ResponseAction | undefined> {
+  try {
+    const openai = getOpenAIClient();
+    
+    // CTA 빈도 조절: 일기 없는 사용자는 더 자주, 있는 사용자는 드물게
+    const ctaFrequencyGuide = hasDiaries
+      ? '기존 사용자이므로 CTA는 매우 드물게 (10번 대화 중 1번). 정말 특별한 순간에만.'
+      : '신규 사용자이므로 CTA를 적극적으로 (3~5번 대화 중 1번). 일기 쓰기의 장점을 알려주는 것이 좋음.';
+
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `당신은 대화 분석가입니다. 사용자와 AI 친구(무디타)의 대화를 분석하여 "일기 쓰러 가기" CTA 버튼을 보여줄지 결정합니다.
+
+## CTA 표시 기준
+${ctaFrequencyGuide}
+
+## CTA를 보여줘야 하는 상황:
+- 사용자가 오늘 있었던 일이나 감정을 자세히 이야기했을 때
+- 사용자가 기억하고 싶은 특별한 순간을 공유했을 때
+- 사용자가 고민이나 생각을 정리하고 싶어할 때
+- 대화가 자연스럽게 마무리되는 시점
+- 무디타의 응답에 일기 쓰기를 권유하는 내용이 포함되어 있을 때
+
+## CTA를 보여주지 말아야 하는 상황:
+- 일반적인 인사나 짧은 대화
+- 사용자가 단순 질문만 했을 때
+- 대화가 아직 진행 중일 때
+- 최근에 이미 CTA를 보여줬을 가능성이 높을 때
+
+현재 대화 수: ${conversationLength}개`
+        },
+        {
+          role: 'user',
+          content: `사용자: ${userMessage}\n\n무디타: ${assistantResponse}`
+        }
+      ],
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'cta_decision',
+          strict: true,
+          schema: {
+            type: 'object',
+            properties: {
+              shouldShowCTA: {
+                type: 'boolean',
+                description: 'CTA 버튼을 보여줄지 여부'
+              },
+              ctaType: {
+                type: ['string', 'null'],
+                enum: ['write_diary', 'view_dashboard', 'view_diary', null],
+                description: 'CTA 타입 (shouldShowCTA가 false면 null)'
+              },
+              reason: {
+                type: 'string',
+                description: '판단 이유 (디버깅용)'
+              }
+            },
+            required: ['shouldShowCTA', 'ctaType', 'reason'],
+            additionalProperties: false
+          }
+        }
+      },
+      temperature: 0.3,
+      max_tokens: 200,
+    });
+
+    const content = response.choices[0]?.message?.content;
+    if (!content) return undefined;
+
+    const decision: CTADecision = JSON.parse(content);
+    
+    if (decision.shouldShowCTA && decision.ctaType) {
+      console.log(`CTA Decision: ${decision.ctaType} - ${decision.reason}`);
+      return CTA_ACTIONS[decision.ctaType];
+    }
+    
+    return undefined;
+  } catch (error) {
+    console.error('CTA analysis error:', error);
+    return undefined;
+  }
+}
+
+/**
+ * Parses CTA marker from LLM response (fallback method)
+ * @param response - Raw LLM response that may contain CTA marker
+ * @returns Object with cleaned response and optional action
+ */
+function parseCTAMarker(response: string): { cleanedResponse: string; action?: ResponseAction } {
+  const match = response.match(CTA_MARKER_PATTERN);
+  
+  if (match) {
+    const ctaType = match[1] as keyof typeof CTA_ACTIONS;
+    const action = CTA_ACTIONS[ctaType];
+    const cleanedResponse = response.replace(CTA_MARKER_PATTERN, '').trim();
+    return { cleanedResponse, action };
+  }
+  
+  return { cleanedResponse: response };
+}
 
 /**
  * Generates a response with full RAG pipeline (retrieval + generation)
@@ -726,7 +1564,7 @@ const NO_CONTEXT_RESPONSE_TEMPLATE = (userName?: string) => {
  * @param chatHistory - Previous messages in the session
  * @param onToken - Callback function called for each streamed token
  * @param userName - Optional user name for personalization
- * @returns Object containing the full response and referenced diary IDs
+ * @returns Object containing the full response, referenced diary IDs, and optional action
  */
 export async function generateRAGResponse(
   userId: number,
@@ -734,40 +1572,127 @@ export async function generateRAGResponse(
   chatHistory: Message[] = [],
   onToken: OnTokenCallback,
   userName?: string
-): Promise<{ response: string; diaryIds: number[] }> {
+): Promise<{ response: string; diaryIds: number[]; action?: ResponseAction; cached?: boolean }> {
   // Check if user has any diary entries
   const userDiaryCount = await prisma.diary.count({
     where: { user_id: userId }
   });
 
   // Handle empty diary state (Requirement 9.1)
+  // 일기가 없어도 자연스럽게 대화하면서 일기 쓰기를 부드럽게 유도
   if (userDiaryCount === 0) {
-    // Stream the no-diary response token by token
-    const response = NO_DIARY_RESPONSE;
-    for (const char of response) {
-      onToken(char);
+    // 첫 대화인 경우에만 인사 메시지 사용
+    const isFirstMessage = chatHistory.length === 0;
+    
+    if (isFirstMessage) {
+      // 첫 대화: 인사하면서 자연스럽게 대화 시작 (CTA 없이)
+      const response = NO_DIARY_RESPONSE_TEMPLATE(userName);
+      for (const char of response) {
+        onToken(char);
+      }
+      return { response, diaryIds: [] };
     }
-    return { response, diaryIds: [] };
+    
+    // 이후 대화: LLM을 통해 자연스럽게 대화 (일기 없이도 대화 가능)
+    const minimalContext = buildContext([], chatHistory);
+    try {
+      const rawResponse = await generateResponse(
+        minimalContext,
+        userMessage,
+        onToken,
+        userName,
+        chatHistory,
+        false,  // hasDiaries = false (일기 없는 사용자)
+        userId  // userId for function calling (tools disabled for no-diary users)
+      );
+      // 마커 파싱 (fallback) + Structured Output CTA 분석
+      const { cleanedResponse } = parseCTAMarker(rawResponse);
+      const action = await analyzeCTAWithStructuredOutput(
+        userMessage,
+        cleanedResponse,
+        false,  // hasDiaries
+        chatHistory.length
+      );
+      return { response: cleanedResponse, diaryIds: [], action };
+    } catch (error) {
+      const fallbackResponse = NO_CONTEXT_RESPONSE_TEMPLATE(userName);
+      for (const char of fallbackResponse) {
+        onToken(char);
+      }
+      return { response: fallbackResponse, diaryIds: [] };
+    }
+  }
+
+  // ============================================================================
+  // Semantic Cache Check (only for users with diaries)
+  // ============================================================================
+  
+  // Only use cache for simple queries without recent chat context
+  // Complex multi-turn conversations should not be cached
+  const shouldUseCache = chatHistory.length <= 2 && userMessage.length >= 5;
+  
+  if (shouldUseCache) {
+    try {
+      const cacheResult = await searchCache(userId, userMessage);
+      
+      if (cacheResult.hit && cacheResult.response) {
+        console.log(`[RAG] Using cached response for user ${userId}`);
+        
+        // Stream the cached response to maintain consistent UX
+        for (const char of cacheResult.response) {
+          onToken(char);
+          // Small delay to simulate streaming (optional, can be removed for faster response)
+        }
+        
+        // Still analyze CTA for cached responses
+        const action = await analyzeCTAWithStructuredOutput(
+          userMessage,
+          cacheResult.response,
+          true,
+          chatHistory.length
+        );
+        
+        return {
+          response: cacheResult.response,
+          diaryIds: cacheResult.diaryIds || [],
+          action,
+          cached: true,
+        };
+      }
+    } catch (cacheError) {
+      // Cache errors should not block the main flow
+      console.error('[RAG] Cache check error:', cacheError);
+    }
   }
 
   // Retrieve relevant context
   const ragContext = await retrieveContext(userId, userMessage, chatHistory);
   
   // Handle empty search results (Requirement 9.2)
-  // If no relevant diaries found but user has diaries, respond without context
+  // 관련 일기가 없어도 자연스럽게 대화 이어감
   if (ragContext.diaries.length === 0) {
-    // Still try to generate a response, but with minimal context
-    // The LLM will respond based on the current message only
-    const minimalContext = buildContext([], chatHistory);
+    // LLM을 통해 자연스럽게 대화 (일기 컨텍스트 없이)
+    const minimalContext = buildContext([], chatHistory, ragContext.moodData);
     
     try {
-      const response = await generateResponse(
+      const rawResponse = await generateResponse(
         minimalContext,
         userMessage,
         onToken,
-        userName
+        userName,
+        chatHistory,
+        true,  // hasDiaries = true (일기 있는 사용자, 관련 일기만 없음)
+        userId  // userId for function calling
       );
-      return { response, diaryIds: [] };
+      // 마커 파싱 (fallback) + Structured Output CTA 분석
+      const { cleanedResponse } = parseCTAMarker(rawResponse);
+      const action = await analyzeCTAWithStructuredOutput(
+        userMessage,
+        cleanedResponse,
+        true,  // hasDiaries
+        chatHistory.length
+      );
+      return { response: cleanedResponse, diaryIds: [], action };
     } catch (error) {
       // If LLM fails, provide a fallback response
       const fallbackResponse = NO_CONTEXT_RESPONSE_TEMPLATE(userName);
@@ -778,18 +1703,40 @@ export async function generateRAGResponse(
     }
   }
   
-  // Generate response with streaming
-  const response = await generateResponse(
+  // Generate response with streaming (일기 있는 사용자, RAG 기반)
+  const rawResponse = await generateResponse(
     ragContext.contextText,
     userMessage,
     onToken,
-    userName
+    userName,
+    chatHistory,
+    true,  // hasDiaries = true (일기 있는 사용자)
+    userId  // userId for function calling
+  );
+  
+  // 마커 파싱 (fallback) + Structured Output CTA 분석
+  const { cleanedResponse } = parseCTAMarker(rawResponse);
+  const action = await analyzeCTAWithStructuredOutput(
+    userMessage,
+    cleanedResponse,
+    true,  // hasDiaries
+    chatHistory.length
   );
   
   // Extract diary IDs for reference
   const diaryIds = extractDiaryIds(ragContext);
   
-  return { response, diaryIds };
+  // ============================================================================
+  // Store in Semantic Cache (async, non-blocking)
+  // ============================================================================
+  if (shouldUseCache && cleanedResponse.length >= 20) {
+    // Store in cache without awaiting (fire and forget)
+    storeInCache(userId, userMessage, cleanedResponse, diaryIds).catch(err => {
+      console.error('[RAG] Failed to store in cache:', err);
+    });
+  }
+  
+  return { response: cleanedResponse, diaryIds, action };
 }
 
 

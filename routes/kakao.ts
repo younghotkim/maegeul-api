@@ -189,7 +189,7 @@ router.get(
 
       try {
         const token = jwt.sign(
-          { userId: user.user_id },
+          { userId: user.user_id, profileName: user.profile_name || user.username },
           process.env.JWT_SECRET as string,
           {
             expiresIn: "1h",

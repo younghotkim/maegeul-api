@@ -136,7 +136,7 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     }
 
     const token = jwt.sign(
-      { userId: user.user_id, profileName: user.profile_name },
+      { userId: user.user_id, profileName: user.profile_name || user.username },
       JWT_SECRET,
       { expiresIn: "1h" }
     );
